@@ -37,8 +37,82 @@ class VoiceAssistant:
         self.text_area = scrolledtext.ScrolledText(self.window, width=70, height=30)
         self.text_area.pack(pady=10, padx=10)
 
-        self.quit_button = tk.Button(self.window, text="종료", command=self.window.quit)
-        self.quit_button.pack(pady=10)
+        # 버튼을 담을 프레임 생성
+        self.buttons_frame = tk.Frame(self.window)
+        self.buttons_frame.pack(pady=5)
+
+        # 시작 버튼 추가
+        self.start_button = tk.Button(self.buttons_frame, text="시작", command=self._start_question)
+        self.start_button.pack(side=tk.LEFT, padx=5)
+
+        # 종료 버튼 추가
+        self.end_button = tk.Button(self.buttons_frame, text="종료", command=self._end_question)
+        self.end_button.pack(side=tk.LEFT, padx=5)
+
+        # 프로그램 종료 버튼
+        self.quit_button = tk.Button(self.buttons_frame, text="프로그램 종료", command=self.window.quit)
+        self.quit_button.pack(side=tk.LEFT, padx=5)
+
+    def _start_question(self):
+        """시작 버튼 클릭 처리"""
+        self.update_status("질문 대기중...", "red")
+        self._display_keyword_text(self.START_KEYWORD)
+        self.collecting_question = True
+        self.question_text = ""
+        # 별도의 스레드에서 질문 수집 시작
+        thread = threading.Thread(target=lambda: self._collect_question_thread())
+        thread.daemon = True
+        thread.start()
+
+    def _collect_question_thread(self):
+        """별도 스레드에서 질문 수집"""
+        try:
+            with sr.Microphone() as source:
+                self.recognizer.adjust_for_ambient_noise(source)
+                while self.collecting_question:
+                    try:
+                        print("음성 입력 대기 중...")
+                        audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=3)
+                        text = self._recognize_speech(audio)
+                        print("인식된 텍스트:", text)
+                        
+                        if self.END_KEYWORD in text:
+                            remaining_text = text.replace(self.END_KEYWORD, "").strip()
+                            if remaining_text:
+                                self.question_text += " " + remaining_text
+                            if self.question_text.strip():
+                                self.update_status("생성중...", "red")
+                                print("질문 처리:", self.question_text.strip())
+                                self.ask_gpt(self.question_text.strip())
+                            break
+                            
+                        self._display_normal_text(text)
+                        self.question_text += " " + text
+                        
+                    except sr.WaitTimeoutError:
+                        continue
+                    except sr.UnknownValueError:
+                        continue
+                    except sr.RequestError:
+                        print("음성 인식 서비스 오류")
+                        continue
+        except Exception as e:
+            print("Error in collect question thread:", str(e))
+        finally:
+            self.collecting_question = False
+            
+    def _end_question(self):
+        """종료 버튼 클릭 처리"""
+        if hasattr(self, 'collecting_question') and hasattr(self, 'question_text'):
+            self.collecting_question = False  # 먼저 수집 중단
+            if self.question_text.strip():
+                self.update_status("생성중...", "red")
+                print("질문 처리:", self.question_text.strip())
+                question = self.question_text.strip()
+                # 별도의 스레드에서 GPT 요청 처리
+                thread = threading.Thread(target=lambda: self.ask_gpt(question))
+                thread.daemon = True
+                thread.start()
 
     def _configure_tags(self):
         """텍스트 영역의 태그 설정"""
@@ -100,38 +174,40 @@ class VoiceAssistant:
 
     def _collect_question(self, source):
         """사용자의 질문 수집"""
-        question = ""
-        last_voice_time = time.time()  # 마지막 음성 인식 시간 초기화
+        self.question_text = ""
+        self.collecting_question = True
+        last_voice_time = time.time()
         
-        while True:
-            current_time = time.time()
-            # 5초 이상 침묵이고 질문이 있으면 처리
-            if current_time - last_voice_time > 5 and question.strip():
-                print("5초 이상 침묵 감지")
-                return question.strip()
-                
+        while self.collecting_question:
             try:
                 print("음성 입력 대기 중...")
-                audio = self.recognizer.listen(source, phrase_time_limit=3)  # 최대 3초 단위로 음성 인식
+                audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=3)  
                 text = self._recognize_speech(audio)
                 print("인식된 텍스트:", text)
-                self._display_normal_text(text)
-                last_voice_time = time.time()  # 음성이 인식되면 시간 갱신
                 
-                # 끝 키워드가 있는 텍스트에서 끝 키워드 제거하고 질문에 추가
                 if self.END_KEYWORD in text:
-                    print("끝 키워드 감지됨")
-                    final_text = text.replace(self.END_KEYWORD, "").strip()
-                    if final_text:
-                        question += final_text + " "
-                    return question.strip()
+                    remaining_text = text.replace(self.END_KEYWORD, "").strip()
+                    if remaining_text:
+                        self.question_text += " " + remaining_text
+                    self.collecting_question = False
+                    return self.question_text.strip()
+                    
+                self._display_normal_text(text)
+                self.question_text += " " + text
+                last_voice_time = time.time()
                 
-                question += text + " "
-            except sr.UnknownValueError:
-                print("음성을 인식할 수 없음")
+            except sr.WaitTimeoutError:
+                current_time = time.time()
+                if current_time - last_voice_time > 5 and self.question_text.strip():
+                    print("5초 이상 침묵 감지")
+                    self.collecting_question = False
+                    return self.question_text.strip()
                 continue
-            except sr.RequestError as e:
-                print("음성 인식 서비스 오류:", str(e))
+                
+            except sr.UnknownValueError:
+                continue
+            except sr.RequestError:
+                print("음성 인식 서비스 오류")
                 continue
 
     def _display_keyword_text(self, text):
